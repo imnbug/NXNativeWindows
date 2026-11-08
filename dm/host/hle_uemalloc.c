@@ -134,10 +134,11 @@ static void ue_span_gate(uint64_t *regs, int param) {
     uint64_t x21 = regs[21];
     if (!dm_ue_span_x21(reserved, base, sentinel, field_a, field_b, &x21)) return;
     regs[21] = x21;
-    LOG("[mem] span reserved %#llx, null-path length %#llx, tail %#llx (second %#llx, third %#llx)",
+    LOG("[mem] span reserved %#llx, null-path length %#llx, tail %#llx (second %#llx, third %#llx, refill %#llx)",
         (unsigned long long)reserved, (unsigned long long)(x21 + 1),
         (unsigned long long)(reserved - (x21 + 1)), (unsigned long long)DM_UE_SPAN_SECOND,
-        (unsigned long long)(reserved - (x21 + 1) - DM_UE_SPAN_SECOND));
+        (unsigned long long)(reserved - (x21 + 1) - DM_UE_SPAN_SECOND - DM_UE_SPAN_MIN),
+        (unsigned long long)DM_UE_SPAN_MIN);
 }
 
 // Called once the modules are loaded and relocated, before any guest code runs

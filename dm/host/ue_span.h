@@ -7,9 +7,14 @@
 //      main+0x141619c had x21 = x24 = 0x200000 and x23 = 21. A 2 GiB arena is larger than twice that
 //      request, so 0x14ab0 rounds it to that power of two.
 //   3. main+0xb0a34. stored = (1 << ((-clz(diff)) & 63)) >> 20, from the constants at main+0xb0670 for
-//      page 0x1000. The byte length is align_up(0x1000 + (stored << 5), 0x1000). 0x14964 and 0x14ab0
-//      then round up to the next power of two when the arena is larger than twice that length, and the
-//      bump is at least the 0x10000 stored at the arena object +0x48.
+//      page 0x1000. The byte length is align_up(stored << 5, 0x1000): (page + (stored << 5) - 1) & -page.
+//      0x14964 and 0x14ab0 then round up to the next power of two when the arena is larger than twice that
+//      length, and the bump is at least the 0x10000 stored at the arena object +0x48.
+//      When that bump is larger than its size class, 0x14ab0's loop calls main+0x28b70. The first call
+//      sees [arena+0x58] == 0 and the byte at +0x68 set, so it bumps [arena+0x48] again (0x10000) and
+//      main+0x28c18 stores 16 zero bytes at the returned address. main+0x28b20 does not test the end.
+//      The store stays inside the block: the offset advances by 0x10 and stops once offset + 0x20 exceeds
+//      the block. Filling the arena exactly makes that returned address the exclusive end.
 //      diff = B - x11 - 1. A, B are ldp [main+0x14514's return, +0x30]. That function returns the address
 //      of main+0x98fc048. When the qword there is 0, main+0x1452c runs first and stores the region base
 //      at +0x30 and base + reserved at +0x38. The first bump returns that base, the compare at main+0xb06ac
@@ -48,11 +53,11 @@ static inline uint64_t dm_ue_span_stored(uint64_t diff) {
     return (1ull << ((-c) & 63)) >> 20;
 }
 static inline uint64_t dm_ue_span_third(uint64_t diff, uint64_t reserved) {
-    return dm_ue_span_bump(DM_UE_SPAN_PAGE + (dm_ue_span_stored(diff) << 5), reserved);
+    return dm_ue_span_bump(dm_ue_span_stored(diff) << 5, reserved);
 }
 
 // 1 = *x21 becomes (reserved - tail) - 1, and add x0, x21, #1 yields the first request.
-// tail is the second bump plus the third bump. 0 = leave the compiled 38 GiB length.
+// tail is the second bump, the third bump, and the 0x10000 freelist refill. 0 = leave the compiled length.
 // sentinel, field_a and field_b are the qwords at main+0x98fc048, +0x78 and +0x80 as they are when
 // the gate runs, which is before main+0x14514. region_base is the qword at main+0x997e1d8.
 static inline int dm_ue_span_x21(uint64_t reserved, uint64_t region_base, uint64_t sentinel,
@@ -60,22 +65,26 @@ static inline int dm_ue_span_x21(uint64_t reserved, uint64_t region_base, uint64
     uint64_t tail, third;
     int same;
     if (!x21 || reserved >= DM_UE_SPAN_DESIGNED || (reserved & (DM_UE_SPAN_PAGE - 1))) return 0;
-    if (!sentinel)
-        same = 1; // main+0x1452c overwrites +0x30/+0x38 with the region base and its end
-    else if (reserved <= UINT64_MAX - region_base && field_a == region_base && field_b == region_base + reserved)
+    if (!sentinel) {
+        if (region_base > UINT64_MAX - reserved) return 0; // main+0x1452c's end = base + reserved would wrap
         same = 1;
-    else if (field_b > field_a)
+    } else if (field_a == region_base) {
+        // The first bump returns this base, so the guest adds the span length. Only B == end matches the fixed tail.
+        if (reserved <= UINT64_MAX - region_base && field_b == region_base + reserved) same = 1;
+        else return 0;
+    } else if (field_b > field_a)
         same = 0;
     else
         return 0;
     if (same) {
-        tail = DM_UE_SPAN_SECOND + DM_UE_SPAN_MIN;
-        // diff = tail - 1. The third bump is the minimum, so the tail is exactly the two later bumps.
+        tail = DM_UE_SPAN_SECOND + DM_UE_SPAN_MIN + DM_UE_SPAN_MIN;
+        // diff = tail - 1. The third bump stays the minimum, and one more minimum is the freelist refill.
         if (dm_ue_span_third(tail - 1, reserved) != DM_UE_SPAN_MIN) return 0;
     } else {
         third = dm_ue_span_third(field_b - field_a - 1, reserved);
-        if (third < DM_UE_SPAN_MIN || DM_UE_SPAN_SECOND > UINT64_MAX - third) return 0;
-        tail = DM_UE_SPAN_SECOND + third;
+        if (third < DM_UE_SPAN_MIN || DM_UE_SPAN_SECOND > UINT64_MAX - third ||
+            DM_UE_SPAN_MIN > UINT64_MAX - (DM_UE_SPAN_SECOND + third)) return 0;
+        tail = DM_UE_SPAN_SECOND + third + DM_UE_SPAN_MIN;
     }
     // reserved >= 2 * tail keeps the first request off the power-of-two path (reserved > 2 * length is false).
     if (tail >= reserved || reserved / 2 < tail) return 0;

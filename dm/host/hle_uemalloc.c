@@ -18,6 +18,8 @@
 // keep the guest's function, which calls Malloc through the vtable
 // Fixed addresses: each row runs only on the main build it was found in (AGENTS.md)
 #include "hle.h"
+#include "ue_span.h"
+#include "ue_pages.h"
 #include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <stdatomic.h>
@@ -116,8 +118,175 @@ int dm_ue_heap_owns(uint64_t a, uint64_t n) {
     return at <= a && a + n <= at + sz && (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
 }
 
+// main+0xb0648 is `add x0, x21, #1` on the null-argument path, after x21 was built as 0x97fffffff.
+// The reserved length and the region base are already stored at main+0x997e1e0 and main+0x997e1d8.
+// main+0x14514 has not run yet, so the qword at main+0x98fc048 is still its relocated initial value.
+static void ue_span_gate(uint64_t *regs, int param) {
+    (void)param;
+    // The gate is planted only for main c6b32f4d3d4243ff190b082b4f6aea18 (that profile's patches.py).
+    module_t *m = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { m = &g_mod[i]; break; }
+    if (!m || m->size < 0x98fc088ull) return;
+    uint64_t reserved = *(uint64_t *)(m->base + 0x997e1e0);
+    uint64_t base = *(uint64_t *)(m->base + 0x997e1d8);
+    uint64_t sentinel = *(uint64_t *)(m->base + 0x98fc048);
+    uint64_t field_a = *(uint64_t *)(m->base + 0x98fc078);
+    uint64_t field_b = *(uint64_t *)(m->base + 0x98fc080);
+    uint64_t x21 = regs[21];
+    if (!dm_ue_span_x21(reserved, base, sentinel, field_a, field_b, &x21)) return;
+    regs[21] = x21;
+    LOG("[mem] span reserved %#llx, null-path length %#llx, tail %#llx (second %#llx, third %#llx, refill %#llx)",
+        (unsigned long long)reserved, (unsigned long long)(x21 + 1),
+        (unsigned long long)(reserved - (x21 + 1)), (unsigned long long)DM_UE_SPAN_SECOND,
+        (unsigned long long)(reserved - (x21 + 1) - DM_UE_SPAN_SECOND - DM_UE_SPAN_MIN),
+        (unsigned long long)DM_UE_SPAN_MIN);
+}
+
+// main c6b32f4d3d4243ff190b082b4f6aea18 calls nn::os::AllocateMemoryPages through the PLT at
+// main+0x7388650 (GOT main+0x98fa240). sdk+0x144840 loads the manager from [sdk+0xb68db8] and adds 0x420.
+// The two commits in the DT_INIT caller return to main+0x291d8 and main+0x29280; x19 there is the commit
+// object, [x19+0x20] its base, [x19+0x30] its stride, and w25/w26 the page indices. The global at
+// main+0x9dcc920 is the pool base that caller adds a group shifted by 29 to. Which tree check returns
+// 0xe03 depends on that base, those indices and the nodes actually registered. This records them and
+// returns the guest result. It does not add a region and it does not turn 0xe03 into success.
+enum { UE_PAGES_CAP = 16 };
+static uint32_t (*g_pages_orig)(uint64_t addr, uint64_t size);
+static int pages_rd(uint64_t a, void *o, size_t n) {
+    vm_size_t g = 0;
+    return a && !vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)o, &g) && g == n;
+}
+int dm_addr_region_at(int i, uint64_t *base, uint64_t *size);
+static void pages_loc(uint64_t a, char *b, size_t n) {
+    module_t *m = module_of((void *)(uintptr_t)a);
+    if (m) snprintf(b, n, "%s+%#llx", m->name, (unsigned long long)(a - (uint64_t)(uintptr_t)m->base));
+    else snprintf(b, n, "%#llx", (unsigned long long)a);
+}
+static int pages_tree(module_t *sdk, dm_ue_page_node *node, int *root, int *trunc) {
+    struct { uint64_t left, right, parent, pad, start, length; } raw;
+    struct { uint64_t ptr; } got[UE_PAGES_CAP];
+    uint64_t slot = 0, mgr = 0, hdr = 0, ptr = 0, stack[UE_PAGES_CAP];
+    int n = 0, sp = 0;
+    *root = -1; *trunc = 0;
+    _Static_assert(sizeof raw == 0x30, "Vamm node links and the start/length pair");
+    if (!pages_rd((uint64_t)(uintptr_t)sdk->base + 0xb68db8, &slot, 8) || !slot) { *trunc = 1; return 0; }
+    mgr = slot + 0x420;
+    if (!pages_rd(mgr + 0x40, &hdr, 8) || !hdr || !pages_rd(hdr + 0x10, &ptr, 8)) { *trunc = 1; return 0; }
+    if (!ptr) return 0;
+    stack[sp++] = ptr;
+    while (sp) {
+        uint64_t p = stack[--sp], link[3];
+        int seen = 0, i;
+        for (i = 0; i < n; i++) if (got[i].ptr == p) { seen = 1; break; }
+        if (seen) continue;
+        if (n == UE_PAGES_CAP) { *trunc = 1; break; }
+        if (!pages_rd(p, &raw, sizeof raw)) { *trunc = 1; break; }
+        got[n].ptr = p;
+        node[n].start = raw.start; node[n].length = raw.length;
+        node[n].left = node[n].right = node[n].parent = -1;
+        link[0] = raw.left; link[1] = raw.right; link[2] = raw.parent;
+        n++;
+        for (i = 0; i < 3; i++) if (link[i]) {
+            if (sp == UE_PAGES_CAP) { *trunc = 1; continue; }
+            stack[sp++] = link[i];
+        }
+    }
+    for (int i = 0; i < n; i++) if (got[i].ptr == ptr) *root = i;
+    for (int i = 0; i < n; i++) {
+        uint64_t l = 0, r = 0, p = 0;
+        if (!pages_rd(got[i].ptr, &raw, sizeof raw)) { *trunc = 1; break; }
+        l = raw.left; r = raw.right; p = raw.parent;
+        for (int k = 0; k < n; k++) {
+            if (l && got[k].ptr == l) node[i].left = k;
+            if (r && got[k].ptr == r) node[i].right = k;
+            if (p && got[k].ptr == p) node[i].parent = k;
+        }
+        if ((l && node[i].left < 0) || (r && node[i].right < 0) || (p && node[i].parent < 0)) *trunc = 1;
+    }
+    return n;
+}
+__attribute__((used)) uint32_t dm_ue_pages_from_guest(uint64_t addr, uint64_t size, uint64_t x19, uint64_t x25, uint64_t x26, uint64_t lr) {
+    uint32_t result = g_pages_orig(addr, size);
+    static _Atomic int logged;
+    if (result != 0xe03 || atomic_fetch_add(&logged, 1) >= 4) return result;
+    module_t *main_m = NULL, *sdk = NULL;
+    for (int i = 0; i < g_nmod; i++) {
+        if (!strcmp(g_mod[i].name, "main")) main_m = &g_mod[i];
+        if (!strcmp(g_mod[i].name, "sdk")) sdk = &g_mod[i];
+    }
+    char where[48]; pages_loc(lr, where, sizeof where);
+    uint64_t off = main_m && lr >= (uint64_t)(uintptr_t)main_m->base ? lr - (uint64_t)(uintptr_t)main_m->base : ~0ull;
+    int known = off == 0x291d8 || off == 0x29280;
+    uint64_t B = 0, P = 0, T = 0, composed = 0, bytes = 0;
+    int have = 0, T_ok = 0;
+    if (known) have = pages_rd(x19 + 0x20, &B, 8) && pages_rd(x19 + 0x30, &P, 8);
+    if (main_m) T_ok = pages_rd((uint64_t)(uintptr_t)main_m->base + 0x9dcc920, &T, 8);
+    if (have) {
+        uint32_t cnt = ((uint32_t)x26 - (uint32_t)x25) + 1u;
+        composed = B + (uint64_t)(uint32_t)x25 * P;
+        bytes = (uint64_t)cnt * P;
+    }
+    dm_ue_page_node node[UE_PAGES_CAP];
+    int root = -1, trunc = 0, n = 0, branch = DM_UE_PAGES_BROKEN;
+    if (sdk) n = pages_tree(sdk, node, &root, &trunc);
+    if (!trunc && sdk) branch = dm_ue_pages_classify(node, n, root, addr, size);
+    LOG("[mem] pages e03 addr=%#llx size=%#llx lr=%s x19=%#llx B=%#llx P=%#llx i=%#llx j=%#llx composed=%#llx match=%d bytes=%#llx size_match=%d obj=%d T=%#llx T_ok=%d branch=%s%s",
+        (unsigned long long)addr, (unsigned long long)size, where, (unsigned long long)x19,
+        (unsigned long long)B, (unsigned long long)P, (unsigned long long)x25, (unsigned long long)x26,
+        (unsigned long long)composed, have && composed == addr, (unsigned long long)bytes, have && bytes == size, have,
+        (unsigned long long)T, T_ok, trunc ? "truncated" : (sdk ? dm_ue_pages_name(branch) : "unread"),
+        known ? "" : " (x19 is not the commit object)");
+    char line[1600]; size_t o = 0; int nr = dm_addr_region_at(0, NULL, NULL);
+    o += (size_t)snprintf(line + o, sizeof line - o, "%d", nr);
+    for (int i = 0; i < nr && i < 8 && o + 48 < sizeof line; i++) {
+        uint64_t b = 0, sz = 0; dm_addr_region_at(i, &b, &sz);
+        o += (size_t)snprintf(line + o, sizeof line - o, " %#llx+%#llx", (unsigned long long)b, (unsigned long long)sz);
+    }
+    LOG("[mem] pages regions %s", line);
+    o = 0;
+    o += (size_t)snprintf(line + o, sizeof line - o, "root=%d n=%d", root, n);
+    for (int i = 0; i < n && o + 80 < sizeof line; i++)
+        o += (size_t)snprintf(line + o, sizeof line - o, " %d:%#llx+%#llx L%d R%d P%d", i,
+            (unsigned long long)node[i].start, (unsigned long long)node[i].length, node[i].left, node[i].right, node[i].parent);
+    LOG("[mem] pages nodes %s", line);
+    return result;
+}
+__attribute__((naked)) static void ue_pages_entry(void) {
+    __asm__ volatile(
+        "stp x29, x30, [sp, #-48]!\n\t"
+        "mov x2, x19\n\t"
+        "mov x3, x25\n\t"
+        "mov x4, x26\n\t"
+        "mov x5, x30\n\t"
+        "bl _dm_ue_pages_from_guest\n\t"
+        "ldp x29, x30, [sp], #48\n\t"
+        "ret\n\t");
+}
+static void ue_pages_install(void) {
+    static const uint32_t plt[4] = { 0xD0012B90u, 0xF9412211u, 0x91090210u, 0xD61F0220u };
+    module_t *m = NULL, *sdk = NULL;
+    for (int i = 0; i < g_nmod; i++) {
+        if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
+        if (!strcmp(g_mod[i].name, "sdk")) sdk = &g_mod[i];
+    }
+    if (!m || strcmp(m->build_id, "c6b32f4d3d4243ff190b082b4f6aea18") || !sdk) return;
+    if (m->size < 0x98fa248ull || sdk->size < 0xb68dc0ull || memcmp(m->base + 0x7388650, plt, sizeof plt)) {
+        LOG("[RED] Dungeons II: AllocateMemoryPages PLT at main+0x7388650 is not the expected stub; the e03 log is not installed");
+        return;
+    }
+    uint64_t *slot = (uint64_t *)(m->base + 0x98fa240), cur = *slot, sb = (uint64_t)(uintptr_t)sdk->base;
+    if (cur < sb || cur >= sb + sdk->size) {
+        LOG("[RED] Dungeons II: AllocateMemoryPages GOT main+0x98fa240 is not in sdk (%#llx); the e03 log is not installed", (unsigned long long)cur);
+        return;
+    }
+    g_pages_orig = (uint32_t (*)(uint64_t, uint64_t))(uintptr_t)cur;
+    *slot = (uint64_t)(uintptr_t)(void *)ue_pages_entry;
+    LOG("[mem] Dungeons II: AllocateMemoryPages logs 0xe03 and returns the guest result");
+}
+
 // Called once the modules are loaded and relocated, before any guest code runs
 void dm_ue_malloc_install(void) {
+    ue_pages_install();
+    gate_obs_set(OBS_UE_SPAN, ue_span_gate);
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
         for (int k = 0; k < (int)(sizeof k_ue / sizeof k_ue[0]); k++) if (!strcmp(g_mod[i].build_id, k_ue[k].build)) {
             uint8_t *b = g_mod[i].base; int L = k_ue[k].layout;

@@ -319,6 +319,17 @@ static void region_free(uint64_t *r, int param) {
     for (int i = 0; i < g_nrgn; i++) if (g_rgn[i].off == off) { g_rgn[i] = g_rgn[--g_nrgn]; break; }
     pthread_mutex_unlock(&g_rgn_lock);
 }
+// The live address-region table. i selects one row; the return value is the count. base is absolute.
+int dm_addr_region_at(int i, uint64_t *base, uint64_t *size) {
+    pthread_mutex_lock(&g_rgn_lock);
+    int n = g_nrgn;
+    if (base && size && g_alias && i >= 0 && i < n) {
+        *base = (uint64_t)(uintptr_t)g_alias + g_rgn[i].off;
+        *size = g_rgn[i].size;
+    } else if (base && size) { *base = 0; *size = 0; }
+    pthread_mutex_unlock(&g_rgn_lock);
+    return n;
+}
 // ---- StandardAllocator's address space ----
 // With virtual address memory, StandardAllocator::Initialize(nullptr, size) takes a region of size from the alias region and lays its heap out over all of it (CentralHeap), and
 // games pass sizes made for the Switch's 64 GB alias region: Pokémon Legends: Z-A 12 GB, Pokémon Scarlet 12 GB, Paper Mario: The Thousand-Year Door 62 GB, Absolum 40 GB. Where the

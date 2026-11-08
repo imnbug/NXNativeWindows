@@ -18,6 +18,7 @@
 // keep the guest's function, which calls Malloc through the vtable
 // Fixed addresses: each row runs only on the main build it was found in (AGENTS.md)
 #include "hle.h"
+#include "ue_span.h"
 #include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <stdatomic.h>
@@ -116,8 +117,24 @@ int dm_ue_heap_owns(uint64_t a, uint64_t n) {
     return at <= a && a + n <= at + sz && (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
 }
 
+// main+0xb0648 is `add x0, x21, #1` on the null-argument path, after x21 was built as 0x97fffffff.
+// The arena object was filled from [main+0x997e1e0] (the reserved length) before this runs.
+static void ue_span_gate(uint64_t *regs, int param) {
+    (void)param;
+    // The gate is planted only for main c6b32f4d3d4243ff190b082b4f6aea18 (that profile's patches.py).
+    module_t *m = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { m = &g_mod[i]; break; }
+    if (!m || m->size < 0x997e1e8ull) return;
+    uint64_t reserved = *(uint64_t *)(m->base + 0x997e1e0), x21 = regs[21];
+    if (!dm_ue_span_x21(reserved, &x21)) return;
+    regs[21] = x21;
+    LOG("[mem] span reserved %#llx, null-path length %#llx, %#llx left at the arena end", (unsigned long long)reserved,
+        (unsigned long long)(x21 + 1), (unsigned long long)DM_UE_SPAN_QUANTUM);
+}
+
 // Called once the modules are loaded and relocated, before any guest code runs
 void dm_ue_malloc_install(void) {
+    gate_obs_set(OBS_UE_SPAN, ue_span_gate);
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
         for (int k = 0; k < (int)(sizeof k_ue / sizeof k_ue[0]); k++) if (!strcmp(g_mod[i].build_id, k_ue[k].build)) {
             uint8_t *b = g_mod[i].base; int L = k_ue[k].layout;
